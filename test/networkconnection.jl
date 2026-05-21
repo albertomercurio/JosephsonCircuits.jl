@@ -733,22 +733,22 @@ import StaticArrays
         # test solveS
         out3 = JosephsonCircuits.solveS(networks, connections;
             small_splitters=false,
-            factorization=JosephsonCircuits.LUfactorization())
+            factorization=JosephsonCircuits.LinearSolve.LUFactorization())
         @test isapprox(out1[1][1],out3[1])
 
         out4 = JosephsonCircuits.solveS(networks, connections;
             small_splitters=false,
-            factorization=JosephsonCircuits.KLUfactorization())
+            factorization=JosephsonCircuits.LinearSolve.KLUFactorization())
         @test isapprox(out1[1][1],out4[1])
 
         out5 = JosephsonCircuits.solveS(networks, connections;
             small_splitters=true,
-            factorization=JosephsonCircuits.LUfactorization())
+            factorization=JosephsonCircuits.LinearSolve.LUFactorization())
         @test isapprox(out1[1][1],out5[1])
 
         out6 = JosephsonCircuits.solveS(networks, connections;
             small_splitters=true,
-            factorization=JosephsonCircuits.KLUfactorization())
+            factorization=JosephsonCircuits.LinearSolve.KLUFactorization())
         @test isapprox(out1[1][1],out6[1])
 
         # test the noise case
@@ -1027,7 +1027,7 @@ import StaticArrays
             [("S1_splitter",2),("S2_splitter",2)],
             [("S1_splitter",3),("S2_splitter",3)],
         ]
-        sol1 = JosephsonCircuits.solveS(networks,connections;factorization=JosephsonCircuits.LUfactorization())
+        sol1 = JosephsonCircuits.solveS(networks,connections;factorization=JosephsonCircuits.LinearSolve.LUFactorization())
         sol2 = JosephsonCircuits.connectS(networks,connections)
         sol3 = Complex{Float64}[0 1;1 0]
 
@@ -1035,7 +1035,7 @@ import StaticArrays
         @test isapprox(sol2[1][1],sol3)
 
         # test the case with noise
-        sol4 = JosephsonCircuits.solveS(networks,connections;factorization=JosephsonCircuits.LUfactorization(), noise = true)
+        sol4 = JosephsonCircuits.solveS(networks,connections;factorization=JosephsonCircuits.LinearSolve.LUFactorization(), noise = true)
         sol5 = JosephsonCircuits.connectS(networks,connections; noise = true)
         @test isapprox(sol4[1],sol3)
         @test isapprox(sol5[1][1],sol3)
@@ -1071,20 +1071,27 @@ import StaticArrays
         networks = [("S1",S1),("S1_mirror",S1_mirror)]
         connections = [[("S1",2),("S1_mirror",2)],[("S1",3),("S1_mirror",3)]]
         
-        ## solveS sometimes gives singular matrix errors, so don't test on this
-        ## network.
-        sol1 = JosephsonCircuits.solveS(networks,connections;factorization=JosephsonCircuits.QRfactorization())
         sol2 = JosephsonCircuits.connectS(networks,connections)
         sol3 = Complex{Float64}[0 1;1 0]
 
-        @test isapprox(sol1[1],sol3)
         @test isapprox(sol2[1][1],sol3)
 
+        @test_throws ArgumentError JosephsonCircuits.solveS(
+            networks,
+            connections;
+            factorization=JosephsonCircuits.LinearSolve.QRFactorization()
+        )
+
         # same as above with noise
-        sol5 = JosephsonCircuits.solveS(networks,connections;factorization=JosephsonCircuits.QRfactorization(),noise = true)
         sol6 = JosephsonCircuits.connectS(networks,connections;noise = true)
-        @test isapprox(sol5[1],sol3)
         @test isapprox(sol6[1][1],sol3)
+
+        @test_throws ArgumentError JosephsonCircuits.solveS(
+            networks,
+            connections;
+            factorization=JosephsonCircuits.LinearSolve.QRFactorization(),
+            noise=true
+        )
     end
 
     @testset "PassiveNetwork" begin

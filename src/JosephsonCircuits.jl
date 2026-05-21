@@ -4,6 +4,7 @@ module JosephsonCircuits
 
 import Graphs
 import FFTW
+import LinearSolve
 import KLU
 import UUIDs
 import Symbolics: Sym, Num, @variables, @syms, @register_symbolic, @wrapped

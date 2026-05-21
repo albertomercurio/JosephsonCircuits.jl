@@ -2636,7 +2636,7 @@ end
 
 function solveS_initialize(networks::AbstractVector,
         connections::AbstractVector; small_splitters::Bool = true,
-        noise::Bool = false, factorization = KLUfactorization(),
+        noise::Bool = false, factorization = LinearSolve.KLUFactorization(),
         internal_ports::Bool = false, Nmodes::Integer = 1,
         nbatches::Integer = Base.Threads.nthreads())
 
@@ -2654,7 +2654,7 @@ end
 
 function solveS_initialize(networks::AbstractVector{PassiveNetwork{T,N}},
         connections::AbstractVector{Tuple{T,T,Int,Int}};
-        noise::Bool = false, factorization = KLUfactorization(),
+        noise::Bool = false, factorization = LinearSolve.KLUFactorization(),
         internal_ports::Bool = false,
         nbatches::Integer = Base.Threads.nthreads()) where {T,N}
 
@@ -2737,6 +2737,10 @@ function solveS_inner!(Se, Si, Ce, Ci, gammaii, See, Sei, Sie, Sii,
             gammaii_indexmap, Sii_indexmap, scattering_parameters,
             noise_covariances, indices, batch, factorization, noise)
 
+    if factorization isa LinearSolve.QRFactorization
+        throw(ArgumentError("LinearSolve.QRFactorization() is not supported by solveS. Use LinearSolve.KLUFactorization() or LinearSolve.LUFactorization()."))
+    end
+
     # make a copy of the scattering matrices for each thread
     See = copy(See)
     Sei = copy(Sei)
@@ -2755,9 +2759,6 @@ function solveS_inner!(Se, Si, Ce, Ci, gammaii, See, Sei, Sie, Sii,
     Sie_dense = zeros(eltype(Se),size(Sie,1),size(Sie,2))
     ai = similar(Se,size(Sii,1),size(See,1))
 
-    # generate an empty FactorizationCache struct
-    cache = FactorizationCache()
-
     # update the scattering matrices for the first element in the batch
     solveS_update!(See, Sei, Sie, Sii, See_indices, Sei_indices,
         Sie_indices, Sii_indices, scattering_parameters, indices[batch[1]])
@@ -2772,6 +2773,14 @@ function solveS_inner!(Se, Si, Ce, Ci, gammaii, See, Sei, Sie, Sii,
     # frequency). we want to retain these structural zeros because the
     # scattering matrix structure must not change.
     gammaii_Sii = spaddkeepzeros(gammaii,-Sii)
+
+    # initialize the LinearSolve cache for reuse across the batch loop
+    # b must be a vector (KLU does not support matrix RHS via LinearSolve);
+    # multi-column solves are done via ldiv! on the cached factorization directly.
+    lincache = LinearSolve.init(
+        LinearSolve.LinearProblem(gammaii_Sii, zeros(eltype(Sie_dense), size(gammaii_Sii, 1))),
+        factorization
+    )
 
     # loop over the dimensions of the array greater than 2
     for (i,j) in enumerate(batch)
@@ -2797,7 +2806,10 @@ function solveS_inner!(Se, Si, Ce, Ci, gammaii, See, Sei, Sie, Sii,
         end
 
         # perform a factorization or update the factorization
-        tryfactorize!(cache, factorization, gammaii_Sii)
+        # update A (marks isfresh=true) and factorize via solve! (result discarded);
+        # actual solves are done via ldiv! on the cached factorization.
+        lincache.A = gammaii_Sii
+        LinearSolve.solve!(lincache)
 
         if noise
             # use this identity to evaluate using ldiv instead of rdiv, so
@@ -2808,7 +2820,11 @@ function solveS_inner!(Se, Si, Ce, Ci, gammaii, See, Sei, Sie, Sii,
                     Sie_dense[k,Sei.rowval[l]] = conj(Sei.nzval[l])
                 end
             end
-            trysolve!(ai, cache.factorization', Sie_dense)
+            # trigger factorization (lincache.A was updated above), then
+            # perform the adjoint solve A'*ai = Sie_dense using the
+            # cached factorization via lincache.cacheval
+            # trigger factorization with a single column, then adjoint-solve all columns
+            LinearAlgebra.ldiv!(ai, lincache.cacheval', Sie_dense)
 
             # Eq. 3.9 from Wedge thesis
             # Snet = See + Sei*inv(gamma_ii - Sii)*Sie
@@ -2820,8 +2836,6 @@ function solveS_inner!(Se, Si, Ce, Ci, gammaii, See, Sei, Sie, Sii,
             # Cs = [Cee Cei;Cie Cii]
             # Cnet = [I, Aie]    * [Cee Cei;    * [I;
             #                       Cie Cii]       Aie']
-            # Cnet = [Cee+Aie*Cie, Cei+Aie*Cii]    * [I;
-            #                                         Aie']
             # Cnet = Cee + Aie*Cie + Cei*Aie' + Aie*Cii*Aie'
             Ce[:,:,j] .= Cee .+  ai'*Cie .+ Cei*ai .+ ai'*Cii*ai
         end
@@ -2838,14 +2852,17 @@ function solveS_inner!(Se, Si, Ce, Ci, gammaii, See, Sei, Sie, Sii,
                 end
             end
 
-            # solve the linear system
+            # solve the linear system (reuses factorization if already done)
             # Eq. 26
-            trysolve!(ai, cache.factorization, Sie_dense)
+            # if not yet factorized (noise==false), trigger factorization first.
+            # Eq. 26
+            # Eq. 26
+            LinearAlgebra.ldiv!(ai, lincache.cacheval, Sie_dense)
 
             # Eq. 3.9 from Wedge thesis or Eq. 28 from Monaco and Tiberio
             # Snet = See + Sei*inv(gamma_ii - Sii)*Sie
-            #      = See + Sei*((gamma_ii - Sii) \ Sie)
-            Se[:,:,j] .= See + Sei*ai
+            #      = See + Sei*(gamma_ii - Sii)\Sie
+            Se[:,:,j] .= See .+  Sei*ai
 
             if !isempty(Si)
                 # derived from Eqns. 24, 28
@@ -2890,6 +2907,10 @@ function solveS!(Se, Si, Ce, Ci, portse, portsi, gammaii, See, Sei, Sie, Sii,
     Sii_indexmap, scattering_parameters, noise_covariances, nbatches,
     factorization, internal_ports, noise)
 
+    if factorization isa LinearSolve.QRFactorization
+        throw(ArgumentError("LinearSolve.QRFactorization() is not supported by solveS. Use LinearSolve.KLUFactorization() or LinearSolve.LUFactorization()."))
+    end
+
     # solve the linear system for the specified frequencies. the response for
     # each frequency is independent so it can be done in parallel; however
     # we want to reuse the factorization object and other input arrays. 
@@ -2913,7 +2934,7 @@ end
 
 """
     solveS(networks, connections; small_splitters::Bool = true,
-        factorization = KLUfactorization(), internal_ports::Bool = false,
+        factorization = LinearSolve.KLUFactorization(), internal_ports::Bool = false,
         nbatches::Integer = Base.Threads.nthreads())
 
 Perform the connections between the networks in `networks` specified by the
@@ -2937,7 +2958,7 @@ the internal ports `portsinternal`.
 - `small_splitters::Bool = true`: if true, then generate any N port splitter
     by combining (N-2) 3 port splitters. if false, then make the N port
     splitter and connect the components to it.
-- `factorization = KLUfactorization()`: use KLU factorization by default. 
+- `factorization = LinearSolve.KLUFactorization()`: use KLU factorization by default. 
     JosephsonCircuits.LUfactorization() is another good choice. Keyword
     arguments can be passed to the solver as keyword arguments to these
     functions.
@@ -2980,7 +3001,7 @@ in IEEE Transactions on Microwave Theory and Techniques, vol. 22, no. 3, pp.
 """
 function solveS(networks::AbstractVector, connections::AbstractVector;
     small_splitters::Bool = true, noise::Bool = false,
-    factorization = KLUfactorization(), internal_ports::Bool = false,
+    factorization = LinearSolve.KLUFactorization(), internal_ports::Bool = false,
     Nmodes::Integer = 1, nbatches::Integer = Base.Threads.nthreads())
 
     init = solveS_initialize(networks,connections;

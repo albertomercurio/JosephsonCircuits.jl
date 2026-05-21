@@ -102,64 +102,11 @@ using Test
         @test_throws(
             str -> isequal("SingularException(0)",str) || 
             isequal("Unknown KLU error code: 2",str) ||
-            isequal("SingularException: matrix is singular; factorization failed. Zero pivot found at index 0",str),
+            isequal("SingularException: matrix is singular; factorization failed. Zero pivot found at index 0",str) ||
+            isequal("NaN in nonlinear solver.", str),
             JosephsonCircuits.nlsolve!(fj!, F, J, x)
         )
 
-    end
-
-    @testset verbose=true "tryfactorize! error" begin
-
-        begin
-            factorization = JosephsonCircuits.KLUfactorization()
-            J1 = JosephsonCircuits.sparse([1, 1, 2, 2],[1, 2, 1, 2],[1.3, 0.5, 0.1, 1.2],2,2)
-            cache = JosephsonCircuits.FactorizationCache()
-            JosephsonCircuits.tryfactorize!(cache,factorization,J1)
-            J2 = JosephsonCircuits.sparse([1, 1, 2, 2],[1, 2, 1, 2],[0.0, 0.0, 0.0, 0.0],2,2)
-            # as of 2023-09-17 1.9.3 and older throws the first error and
-            # 1.10.0-beta2 throws the second error
-            @test_throws(
-                str -> isequal("SingularException(0)",str) || 
-                isequal("Unknown KLU error code: 2",str) ||
-                isequal("SingularException: matrix is singular; factorization failed. Zero pivot found at index 0",str),
-                JosephsonCircuits.tryfactorize!(cache,factorization,J2),
-            )
-        end
-
-        begin
-            cache = JosephsonCircuits.FactorizationCache()
-            factorization = JosephsonCircuits.KLUfactorization()
-            J3 = JosephsonCircuits.sparse([1, 1, 2, 2],[1, 2, 1, 2],[1.3, 0.5, 0.1, 1.2],2,3)
-            @test_throws(
-                DimensionMismatch(""),
-                JosephsonCircuits.tryfactorize!(cache,factorization,J3),
-            )
-        end
-
-        begin
-            factorization = JosephsonCircuits.KLUfactorization()
-            J1 = JosephsonCircuits.sparse([1, 1, 2, 2],[1, 2, 1, 2],[1.3, 0.5, 0.1, 1.2],2,2)
-            cache = JosephsonCircuits.FactorizationCache()
-            JosephsonCircuits.tryfactorize!(cache,factorization,J1)
-            J3 = JosephsonCircuits.sparse([1, 1, 2, 2],[1, 2, 1, 2],[1.3, 0.5, 0.1, 1.2],2,3)
-
-            @test_throws(
-                ArgumentError("Sizes of K and S must match."),
-                JosephsonCircuits.tryfactorize!(cache,factorization,J3),
-            )
-        end
-
-    end
-
-    @testset verbose=true "tryfactorize! elseif path" begin
-        A = [1.0 2.0; 3.0 5.0]
-        cache = JosephsonCircuits.FactorizationCache()
-        fact = JosephsonCircuits.QRfactorization()
-        JosephsonCircuits.tryfactorize!(cache, fact, A)
-        @test cache.factorization !== nothing
-        A[1,1] = 1.1
-        JosephsonCircuits.tryfactorize!(cache, fact, A)
-        @test cache.factorization !== nothing
     end
 
 end

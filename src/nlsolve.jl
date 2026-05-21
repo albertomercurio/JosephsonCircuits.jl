@@ -1,161 +1,5 @@
 
 
-"""
-    Factorization(outofplace,inplace,kwargs)
-
-A structure to hold the factorizations and their keyword arguments.
-
-```
-"""
-struct Factorization
-    factorize
-    factorize!
-    kwargs
-end
-
-function KLUfactorization(;kwargs...)
-    return Factorization(KLU.klu,KLU.klu!,kwargs)
-end
-
-function LUfactorization(;kwargs...)
-    return Factorization(lu,lu!,kwargs)
-end
-
-function QRfactorization(;kwargs...)
-    return Factorization(qr,nothing,kwargs)
-end
-
-# fallback method to handle everything but QR adjoint
-function myldiv!(x,F,b)
-    return ldiv!(x,F,b)
-end
-
-# workaround for lack of QR adjoint factorization
-# modification of solution proposed here
-# and https://github.com/JuliaSparse/SparseArrays.jl/issues/656
-# explanation: https://www.netlib.org/lapack/lug/node41.html
-# and based in part on ldiv! in spqr.jl to handle the rank deficient case
-# https://github.com/JuliaSparse/SparseArrays.jl/blob/main/src/solvers/spqr.jl
-function myldiv!(x::StridedVecOrMat{<:Number},Fadj::LinearAlgebra.AdjointFactorization{<:Number, <:SparseArrays.SPQR.QRSparse},
-                b::StridedVecOrMat{<:Number})
-    F = parent(Fadj)
-    m, n = size(F)
-    pcol = F.pcol
-    prow = F.prow
-    rnk = rank(F)
-
-    nrhs = size(b, 2)
-
-    # define a workspace
-    W = Matrix{eltype(b)}(undef, m, nrhs)
-
-    # c[1:rnk] = first rnk permuted columns of b with the rest of c zero.
-    @inbounds for j in 1:nrhs
-        for i in 1:rnk
-            W[i, j] = b[pcol[i], j]
-        end
-        for i in (rnk+1):m
-            W[i, j] = zero(eltype(W))
-        end
-    end
-
-    # solve R11^H * y[1:rnk] = c[1:rnk]
-    if rnk > 0
-        R11 = F.R[1:rnk, 1:rnk]
-        ldiv!(UpperTriangular(R11)', view(W, 1:rnk, :))
-    end
-
-    # W = Q*y
-    lmul!(F.Q, W)
-
-    # get the solution
-    @inbounds for j in 1:nrhs
-        for i in 1:m
-            x[prow[i], j] = W[i, j]
-        end
-    end
-
-    return x
-end
-
-"""
-    FactorizationCache(factorization)
-
-A cache for the factorization object.
-
-# Examples
-```jldoctest
-julia> JosephsonCircuits.FactorizationCache(JosephsonCircuits.KLU.klu(JosephsonCircuits.sparse([1, 2], [1, 2], [1/2, 1/2], 2, 2)));
-
-```
-"""
-mutable struct FactorizationCache
-    factorization
-end
-
-function FactorizationCache()
-    return FactorizationCache(nothing)
-end
-
-"""
-    tryfactorize!(cache::FactorizationCache,
-        factorization::Factorization, A::AbstractArray)
-
-Factorize the matrix `A` using the factorization from `factorization` and
-store the result in `cache`. Attempt to reuse the symbolic factorization. Redo the
-symbolic factorization if we get a SingularException.
-
-"""
-function tryfactorize!(cache::FactorizationCache,
-    factorization::Factorization, A::AbstractMatrix)
-
-    # if the factorization cache is empty then generate a factorizaion
-    if isnothing(cache.factorization)
-        cache.factorization = factorization.factorize(A;
-            factorization.kwargs...)
-    # otherwise, try to update the factorization, falling back to generating
-    # a new one if that fails
-    elseif isnothing(factorization.factorize!)
-        cache.factorization = factorization.factorize(A;
-            factorization.kwargs...)
-    else
-        try
-            # update the factorization. the sparsity structure does 
-            # not change so we can reuse the factorization object.
-            factorization.factorize!(cache.factorization, A;
-                factorization.kwargs...)
-        catch e
-            if isa(e, SingularException)
-                # reusing the symbolic factorization can sometimes
-                # lead to numerical problems. if the first linear
-                # solve fails try factoring and solving again
-                cache.factorization = factorization.factorize(A;
-                    factorization.kwargs...)
-            else
-                throw(e)
-            end
-        end
-    end
-    return cache
-end
-
-
-"""
-    trysolve!(x,factorization,b)
-
-First try to solve a linear system using ldiv! then if it errors, use \\. The
-motivation for this function is some factorizations such as `qr` with sparse
-matrices don't support ldiv!. 
-"""
-function trysolve!(x,factorization,b)
-    try
-        myldiv!(x,factorization,b)
-    catch
-        x .= factorization \ b
-    end
-    return x
-end
-
 
 """
     linesearch(f, fp, dfdalpha, alphamin)
@@ -204,7 +48,7 @@ end
 """
     nlsolve!(fj!::Function, F::AbstractVector{T}, J::AbstractArray{T},
         x::Vector{T}; iterations=1000, ftol=1e-8, switchofflinesearchtol = 1e-5,
-        alphamin = 1e-4,factorization = KLUfactorization())
+        alphamin = 1e-4, factorization = LinearSolve.KLUFactorization())
 
 A simple nonlinear solver using Newton's method with linesearch based on
 Nocedal and Wright, chapter 3 section 5.
@@ -213,11 +57,9 @@ This solver attempts to find x such that f(x) == 0, where f is a
 nonlinear function with Jacobian J.
 
 A few points to note:
-(1) It uses KLU factorization, so only works on sparse matrices.
-(2) The Jacobian J cannot change sparsity structure.
-(3) This function attempts to reuse the symbolic factorization which can
-    sometimes result in a SingularException, which we catch, then create a
-    new factorization object.
+(1) The Jacobian J cannot change sparsity structure.
+(2) Reuses symbolic factorization across Newton iterations via LinearSolve.jl's
+    caching interface.
 
 # Arguments
 - `fj!`: a function to compute a vector-valued objective function and
@@ -257,7 +99,7 @@ true
 """
 function nlsolve!(fj!::Function, F::AbstractVector{T}, J::AbstractArray{T},
     x::Vector{T}; iterations=1000, ftol=1e-8, switchofflinesearchtol = 1e-5,
-    alphamin = 1e-4,factorization = KLUfactorization()) where T
+    alphamin = 1e-4, factorization = LinearSolve.KLUFactorization()) where T
 
     if size(J,1) != size(J,2)
         throw(DimensionMismatch(lazy"The Jacobian `J` matrix must be square."))
@@ -271,18 +113,12 @@ function nlsolve!(fj!::Function, F::AbstractVector{T}, J::AbstractArray{T},
         throw(DimensionMismatch(lazy"First axis of the Jacobian `J` must have the same length as the residual `F`."))
     end
 
-    cache = FactorizationCache()
-    tryfactorize!(cache,factorization,J)
+    # Initialise LinearSolve cache once; subsequent solves reuse symbolic
+    # factorization automatically (e.g. KLU.klu! on the same sparsity pattern).
+    lincache = LinearSolve.init(LinearSolve.LinearProblem(J, F), factorization)
 
     deltax = copy(x)
 
-    # Nsamples = 100
-    # samples = Float64[]
-    fmin = Float64[]
-    fvals = Float64[]
-    fpvals = Float64[]
-    dfdalphavals = Float64[]
-    alphas = Float64[]
     normF = Float64[]
     alpha1 = 0.0
 
@@ -291,7 +127,7 @@ function nlsolve!(fj!::Function, F::AbstractVector{T}, J::AbstractArray{T},
     for n in 1:iterations
 
         if alpha1 == 1.0
-            # if alpha was 1, we don't need to update the function 
+            # if alpha was 1, we don't need to update the function
             # because we have already calculated that in the last
             # loop. just update the jacobian. since we set alpha1=0
             # before the loop, this will never be called on the first
@@ -304,18 +140,19 @@ function nlsolve!(fj!::Function, F::AbstractVector{T}, J::AbstractArray{T},
 
         push!(normF, norm(F))
 
-        # factor the Jacobian
-        tryfactorize!(cache,factorization,J)
-
-        # solve the linear system
-        trysolve!(deltax, cache.factorization, F)
+        # factor the Jacobian and solve the linear system J * deltax = F,
+        # reusing the symbolic factorization across iterations.
+        lincache.A = J
+        lincache.b = F
+        sol = LinearSolve.solve!(lincache)
+        deltax .= sol.u
 
         # multiply deltax by -1
         rmul!(deltax, -1)
 
         # calculate the objective function and the derivative of the objective
         # with respect to the scalar variable alpha which parameterizes the
-        # path between the old x and the new x. 
+        # path between the old x and the new x.
         # Note: the dot product takes the complex conjugate of the first vector
         f = real(0.5*dot(F, F))
         dfdalpha = real(dot(F, J, deltax))
@@ -333,19 +170,15 @@ function nlsolve!(fj!::Function, F::AbstractVector{T}, J::AbstractArray{T},
         normx = norm(x)
         if normx > 0 && sqrt(fp)/normx <= switchofflinesearchtol && sqrt(f)/normx <= switchofflinesearchtol
             alpha1 = 1.0
-            # println("norm(F)/norm(phi): ",sqrt(fp)/norm(x))
         end
 
         # update x
         x .+= deltax*alpha1
-        # push!(alphas,alpha1)
 
         if norm(F,Inf) <= ftol || ( norm(x) > 0 && norm(F)/norm(x) < ftol)
             # terminate iterations if infinity norm or relative norm are less
             # than ftol. check that norm(x) is greater than zero to avoid
-            # divide by zero errors. 
-            # println("converged to: infinity norm of : ",norm(F,Inf)," after ",n," iterations")
-            # println("norm(F)/norm(phi): ",norm(F)/norm(x))
+            # divide by zero errors.
             break
         end
 
@@ -353,8 +186,6 @@ function nlsolve!(fj!::Function, F::AbstractVector{T}, J::AbstractArray{T},
             @warn string(lazy"Solver did not converge after maximum iterations of ", n,".")
             println(lazy"norm(F)/norm(x): ", norm(F)/norm(x))
             println(lazy"Infinity norm: ", norm(F,Inf))
-            # error(" ")
-            # @show alphas
         end
     end
     return nothing

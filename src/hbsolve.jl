@@ -153,7 +153,7 @@ end
 #         sensitivitynames::Vector{String} = String[], returnSsensitivity = false,
 #         returnZ = false, returnZadjoint = false,
 #         returnZsensitivity = false, returnZsensitivityadjoint = false,
-#         factorization = KLUfactorization())
+#         factorization = LinearSolve.KLUFactorization())
 
 # Calls the new harmonic balance solvers, [`hbnlsolve`](@ref) and
 # [`hblinsolve`](@ref), which work for an arbitrary number of modes and ports),
@@ -179,7 +179,7 @@ function hbsolve(ws, wp, Ip, Nsignalmodes::Int, Npumpmodes::Int, circuit,
     returnSsensitivity::Bool = false, returnZ::Bool = false,
     returnZadjoint::Bool = false, returnZsensitivity::Bool = false,
     returnZsensitivityadjoint::Bool = false,
-    factorization = KLUfactorization())
+    factorization = LinearSolve.KLUFactorization())
 
     # Base.depwarn("""
     # Calls the new harmonic balance solvers, [`hbnlsolve`](@ref) and
@@ -281,7 +281,7 @@ end
         keyedarrays = true, sensitivitynames::Vector{String} = String[],
         returnSsensitivity = false, returnZ = false, returnZadjoint = false,
         returnZsensitivity = false, returnZsensitivityadjoint = false,
-        factorization = KLUfactorization()) where {N,M,K}
+        factorization = LinearSolve.KLUFactorization()) where {N,M,K}
 
 Calls the harmonic balance solvers, [`hbnlsolve`](@ref) and
 [`hblinsolve`](@ref), which work for an arbitrary number of modes and ports,
@@ -380,7 +380,7 @@ and [`hblinsolve`](@ref).
     matrix from the linearized simulations (in progress).
 - `returnZsensitivityadjoint = false`: return the Z parameter sensitivity
     matrix from the linearized adjoint simulations (in progress).
-- `factorization = KLUfactorization()`: the type of factorization to use for
+- `factorization = LinearSolve.KLUFactorization()`: the type of factorization to use for
     the nonlinear and the linearized simulations.
 
 # Returns
@@ -402,7 +402,7 @@ function hbsolve(ws, wp::NTuple{N,Number}, sources::Vector,
     returnSsensitivity::Bool = false, returnZ::Bool = false,
     returnZadjoint::Bool = false, returnZsensitivity::Bool = false,
     returnZsensitivityadjoint::Bool = false,
-    factorization = KLUfactorization()) where {N,M}
+    factorization = LinearSolve.KLUFactorization()) where {N,M}
 
     # calculate the Frequencies struct
     freq = removeconjfreqs(
@@ -535,7 +535,7 @@ consisting of an arbitrary number of large signals (strong tones) from
     matrix from the linearized simulations (in progress).
 - `returnZsensitivityadjoint = false`: return the Z parameter sensitivity
     matrix from the linearized adjoint simulations (in progress).
-- `factorization = KLUfactorization()`: the type of factorization to use for
+- `factorization = LinearSolve.KLUFactorization()`: the type of factorization to use for
     the nonlinear and the linearized simulations.
 
 # Returns
@@ -609,7 +609,7 @@ function hblinsolve(w, circuit,circuitdefs; Nmodulationharmonics = (0,),
     returnSsensitivity::Bool = false, returnZ::Bool = false,
     returnZadjoint::Bool = false, returnZsensitivity::Bool = false,
     returnZsensitivityadjoint::Bool = false,
-    factorization = KLUfactorization())
+    factorization = LinearSolve.KLUFactorization())
 
     # parse and sort the circuit
     psc = parsesortcircuit(circuit, sorting = sorting)
@@ -728,7 +728,7 @@ function hblinsolve(w, psc::ParsedSortedCircuit,
     returnSsensitivity::Bool = false, returnZ::Bool = false,
     returnZadjoint::Bool = false, returnZsensitivity::Bool = false,
     returnZsensitivityadjoint::Bool = false,
-    factorization = KLUfactorization())
+    factorization = LinearSolve.KLUFactorization())
 
     Nsignalmodes = length(signalfreq.modes)
     # calculate the numeric matrices
@@ -1204,9 +1204,13 @@ function hblinsolve_inner!(S, Snoise, Ssensitivity, Z, Zadjoint, Zsensitivity,
     AoLjnmconj = copy(AoLjnm)
     conj!(AoLjnmconj.nzval)
 
-    # if using the KLU factorization and sparse solver then make a 
-    # factorization for the sparsity pattern.
-    cache = FactorizationCache()
+    # initialize the LinearSolve cache with the sparsity structure of Asparsecopy.
+    # the symbolic factorization is reused across iterations of the frequency loop.
+    # b must be a vector (KLU does not support matrix RHS via LinearSolve);
+    lincache = LinearSolve.init(
+        LinearSolve.LinearProblem(Asparsecopy, zeros(eltype(bnm), size(Asparsecopy, 1))),
+        factorization
+    )
 
     # if the scattering matrix is empty define a new working matrix
     if isempty(S)
@@ -1294,12 +1298,15 @@ function hblinsolve_inner!(S, Snoise, Ssensitivity, Z, Zadjoint, Zsensitivity,
             Diagonal(ones(size(invLnm,1))), invLnmindexmap, real.(wmodesm) .< 0,
             wmodesm, invLnmfreqsubstindices, symfreqvar)
 
-        # factor the sparse matrix
+        # factor the sparse matrix and solve the linear system
         # factorklu!(cache, Asparsecopy)
-        tryfactorize!(cache, factorization, Asparsecopy)
-
-        # solve the linear system
-        trysolve!(phin, cache.factorization, bnm)
+        # update A (marks isfresh=true), trigger factorization with a single column,
+        # then solve all columns via ldiv! on the cached factorization.
+        # update A (marks isfresh=true), factorize via solve! (result discarded),
+        # then solve all columns via ldiv! on the cached factorization.
+        lincache.A = Asparsecopy
+        LinearSolve.solve!(lincache)
+        LinearAlgebra.ldiv!(phin, lincache.cacheval, bnm)
 
         # convert to node voltages. node flux is defined as the time integral
         # of node voltage so node voltage is derivative of node flux which can
@@ -1353,11 +1360,14 @@ function hblinsolve_inner!(S, Snoise, Ssensitivity, Z, Zadjoint, Zsensitivity,
                 Diagonal(ones(size(invLnm,1))),invLnmindexmap, real.(wmodesm) .< 0,
                 wmodesm, invLnmfreqsubstindices, symfreqvar)
 
-            # factor the sparse matrix
-            tryfactorize!(cache, factorization, Asparsecopy)
-
-            # solve the linear system
-            trysolve!(phin, cache.factorization, bnm)
+            # factor the sparse matrix and solve the linear system
+            # update A (marks isfresh=true), trigger factorization with a single column,
+            # then solve all columns via ldiv! on the cached factorization.
+            # update A (marks isfresh=true), factorize via solve! (result discarded),
+            # then solve all columns via ldiv! on the cached factorization.
+            lincache.A = Asparsecopy
+            LinearSolve.solve!(lincache)
+            LinearAlgebra.ldiv!(phin, lincache.cacheval, bnm)
 
             # copy the nodeflux adjoint for output
             if !isempty(nodefluxadjoint)
@@ -1538,7 +1548,7 @@ function hbnlsolve(w::NTuple{N,Number}, Nharmonics::NTuple{N,Int}, sources,
     switchofflinesearchtol = 1e-5, alphamin = 1e-4, symfreqvar = nothing,
     sorting= :number, keyedarrays::Bool = true,
     sensitivitynames::Vector{String} = String[],
-    factorization = KLUfactorization()) where {N}
+    factorization = LinearSolve.KLUFactorization()) where {N}
 
     # calculate the frequency struct
     freq = removeconjfreqs(
@@ -1639,7 +1649,7 @@ function hbnlsolve(w, sources, frequencies::Frequencies,
     ftol = 1e-8, switchofflinesearchtol = 1e-5, alphamin = 1e-4,
     symfreqvar = nothing, keyedarrays::Bool = true,
     sensitivitynames::Vector{String} = String[],
-    factorization = KLUfactorization())
+    factorization = LinearSolve.KLUFactorization())
 
 # function hbnlsolve(w::NTuple{N,Number}, sources, frequencies::Frequencies{N},
 #     indices::FourierIndices{N}, psc::ParsedSortedCircuit, cg::CircuitGraph,
@@ -1647,7 +1657,7 @@ function hbnlsolve(w, sources, frequencies::Frequencies,
 #     ftol = 1e-8, switchofflinesearchtol = 1e-5, alphamin = 1e-4,
 #     symfreqvar = nothing, keyedarrays::Bool = true,
 #     sensitivitynames::Vector{String} = String[],
-#     factorization = KLUfactorization()) where {N}
+#     factorization = LinearSolve.KLUFactorization()) where {N}
 
     Nharmonics = frequencies.Nharmonics
     Nw = frequencies.Nw
